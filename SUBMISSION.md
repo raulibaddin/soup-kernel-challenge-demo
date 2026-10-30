@@ -1,9 +1,9 @@
 # Submission: Soup Kernel Challenge — Decentrathon 6.0
 
 ## Links
-- **Repository, final commit:** `https://github.com/MakazhanAlpamys/soup-kernel-challenge/commit/<FINAL_COMMIT_SHA>`
+- **Repository, final commit:** https://github.com/raulibaddin/soup-kernel-challenge-demo/commit/3f51e29bcd5acfce0bf92b84cc33e9711ff50280
 - **Public Kaggle notebook (saved version):** `https://www.kaggle.com/code/<user>/soup-kernel-challenge-submission?scriptVersionId=<VERSION_ID>`
-  *(Ensure `COMMIT` in cell 1 is set to the commit hash above)*
+  *(Set `REPO_URL` to `https://github.com/raulibaddin/soup-kernel-challenge-demo.git` and `COMMIT` in cell 1)*
 - **Demo video (<= 3 minutes):** `<DEMO_VIDEO_LINK>`
 - **Presentation:** `<PRESENTATION_SLIDES_LINK>`
 
