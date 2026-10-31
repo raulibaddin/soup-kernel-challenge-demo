@@ -24,9 +24,12 @@ Optimizations:
 from .swiglu import patch_qwen2_mlp
 from .rms_norm import patch_qwen2_rmsnorm
 from .rope import patch_qwen2_rope
+from .chunk_loss import patch_qwen2_chunked_loss, patch_sft_trainer
 
 
 def apply():
-    patch_qwen2_mlp()       # custom kernel: 2D block-tiled fused SwiGLU (fwd + bwd)
-    patch_qwen2_rmsnorm()   # custom kernel: fused RMSNorm (fwd + bwd)
-    patch_qwen2_rope()      # custom kernel: fused RoPE (fwd + bwd)
+    patch_qwen2_mlp()            # custom kernel: 2D block-tiled fused SwiGLU (fwd + bwd)
+    patch_qwen2_rmsnorm()        # custom kernel: fused RMSNorm (fwd + bwd)
+    patch_qwen2_rope()           # custom kernel: fused RoPE (fwd + bwd)
+    patch_qwen2_chunked_loss()   # memory opt: micro-chunked causal LM output & loss
+    patch_sft_trainer()          # streaming TRL metrics & Rewind flight recorder integration

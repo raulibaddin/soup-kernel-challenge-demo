@@ -221,3 +221,207 @@ def test_rope_realistic_frequencies(dtype, B, H, S, D):
     tol = TOLERANCE[dtype]
     torch.testing.assert_close(tri_q, ref_q.detach(), rtol=tol, atol=tol)
     torch.testing.assert_close(q_tri.grad, ref_dq, rtol=tol, atol=tol)
+
+
+# ============ Chunked Causal LM Loss Tests ============
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("B, S, H, V", [
+    (2, 16, 64, 256),
+    (4, 32, 128, 512),
+])
+def test_chunked_loss_scalar_and_gradients(dtype, B, S, H, V):
+    """Test that micro-chunked causal LM loss and hidden-state gradients match standard unchunked PyTorch."""
+    from solution.chunk_loss import chunked_causal_lm_loss
+
+    torch.manual_seed(42)
+    hidden_ref = torch.randn((B, S, H), device="cuda", dtype=dtype, requires_grad=True)
+    hidden_custom = hidden_ref.clone().detach().requires_grad_(True)
+
+    lm_head = torch.nn.Linear(H, V, bias=False, device="cuda", dtype=dtype)
+    for p in lm_head.parameters():
+        p.requires_grad_(False)
+
+    labels = torch.randint(0, V, (B, S), device="cuda")
+    # Mask out prompt positions and padding
+    labels[0, :4] = -100
+    labels[1, 20:] = -100
+
+    # 1. Unchunked PyTorch reference
+    logits_full = lm_head(hidden_ref)
+    shift_logits = logits_full[:, :-1, :].reshape(-1, V)
+    shift_labels = labels[:, 1:].reshape(-1)
+    loss_ref = torch.nn.functional.cross_entropy(shift_logits.float(), shift_labels, ignore_index=-100)
+    loss_ref.backward()
+    dx_ref = hidden_ref.grad.clone()
+
+    # 2. Custom chunked implementation
+    loss_chunked, metrics = chunked_causal_lm_loss(
+        hidden_custom, lm_head.weight, labels, chunk_size=8
+    )
+    loss_chunked.backward()
+    dx_chunked = hidden_custom.grad.clone()
+
+    tol = 1e-3 if dtype == torch.float16 else 1e-5
+    torch.testing.assert_close(loss_chunked.float(), loss_ref.float(), rtol=tol, atol=tol)
+    torch.testing.assert_close(dx_chunked, dx_ref, rtol=tol, atol=tol)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_chunked_loss_metrics_and_rewind_row_losses(dtype):
+    """Test that chunked entropy, accuracy, and rewind row losses match unchunked formulas exactly."""
+    from solution.chunk_loss import chunked_causal_lm_loss
+
+    B, S, H, V = 2, 16, 64, 256
+    torch.manual_seed(42)
+
+    hidden = torch.randn((B, S, H), device="cuda", dtype=dtype)
+    lm_head = torch.nn.Linear(H, V, bias=False, device="cuda", dtype=dtype)
+    labels = torch.randint(0, V, (B, S), device="cuda")
+    labels[0, :3] = -100
+    labels[1, 10:] = -100
+
+    # 1. Unchunked references
+    logits_full = lm_head(hidden)
+    log_probs_full = torch.nn.functional.log_softmax(logits_full.float(), dim=-1)
+    ent_ref = -(torch.exp(log_probs_full) * log_probs_full).sum(dim=-1)
+
+    shift_labels = labels[:, 1:]
+    row_loss_ref = []
+    row_tokens_ref = []
+    for i in range(shift_labels.size(0)):
+        targets = shift_labels[i]
+        token_ce = torch.nn.functional.cross_entropy(
+            logits_full[i, :-1, :].float(), targets, reduction="none", ignore_index=-100
+        )
+        mask = (targets != -100).float()
+        tokens = mask.sum()
+        total = (token_ce * mask).sum()
+        row_loss_ref.append(float(total / tokens.clamp(min=1.0)))
+        row_tokens_ref.append(int(tokens.item()))
+
+    # 2. Chunked metrics
+    _, metrics = chunked_causal_lm_loss(hidden, lm_head.weight, labels, chunk_size=8)
+
+    # Verify entropy
+    tol = 1e-3 if dtype == torch.float16 else 1e-5
+    torch.testing.assert_close(metrics.token_entropy, ent_ref, rtol=tol, atol=tol)
+
+    # Verify per-row losses matching Soup rewind_hf.py formula
+    token_loss_2d = metrics.token_loss[:, :-1]
+    tokens_calc = (labels[:, 1:] != -100).sum(dim=1)
+    totals_calc = token_loss_2d.sum(dim=1)
+    row_loss_chunked = [float(tot / tok.clamp(min=1)) for tot, tok in zip(totals_calc, tokens_calc)]
+    row_tokens_chunked = [int(c) for c in tokens_calc]
+
+    assert row_tokens_chunked == row_tokens_ref
+    for r_ref, r_chk in zip(row_loss_ref, row_loss_chunked):
+        assert abs(r_ref - r_chk) < tol
+
+
+def test_chunked_loss_propagates_to_preceding_layers_and_lora():
+    """Verify that gradients propagate to preceding layers while frozen lm_head receives no gradients."""
+    from solution.chunk_loss import chunked_causal_lm_loss
+
+    B, S, H, V = 2, 8, 32, 64
+    torch.manual_seed(42)
+
+    # Simulate preceding layer (e.g. projection with LoRA-like adapter)
+    preceding_ref = torch.nn.Linear(H, H, bias=False, device="cuda", dtype=torch.float32)
+    preceding_custom = torch.nn.Linear(H, H, bias=False, device="cuda", dtype=torch.float32)
+    preceding_custom.weight.data.copy_(preceding_ref.weight.data)
+
+    lm_head = torch.nn.Linear(H, V, bias=False, device="cuda", dtype=torch.float32)
+    for p in lm_head.parameters():
+        p.requires_grad_(False)
+
+    x = torch.randn((B, S, H), device="cuda", dtype=torch.float32)
+    labels = torch.randint(0, V, (B, S), device="cuda")
+
+    # Reference run
+    h_ref = preceding_ref(x)
+    l_ref = lm_head(h_ref)
+    loss_ref = torch.nn.functional.cross_entropy(
+        l_ref[:, :-1, :].reshape(-1, V), labels[:, 1:].reshape(-1), ignore_index=-100
+    )
+    loss_ref.backward()
+
+    # Custom chunked run
+    h_custom = preceding_custom(x)
+    loss_custom, _ = chunked_causal_lm_loss(h_custom, lm_head.weight, labels, chunk_size=4)
+    loss_custom.backward()
+
+    # Preceding layer weights must receive exact gradients
+    torch.testing.assert_close(preceding_custom.weight.grad, preceding_ref.weight.grad, rtol=1e-5, atol=1e-5)
+    # Frozen lm_head must have no gradient
+    assert lm_head.weight.grad is None
+
+
+def test_chunked_loss_instrumentation():
+    """Verify that the chunked implementation increments CHUNKED_LOSS_CALL_COUNT upon execution."""
+    from solution.chunk_loss import chunked_causal_lm_loss, CHUNKED_LOSS_CALL_COUNT
+
+    count_before = CHUNKED_LOSS_CALL_COUNT
+    B, S, H, V = 1, 4, 16, 32
+    hidden = torch.randn((B, S, H), device="cuda", dtype=torch.float32)
+    weight = torch.randn((V, H), device="cuda", dtype=torch.float32)
+    labels = torch.randint(0, V, (B, S), device="cuda")
+
+    _ = chunked_causal_lm_loss(hidden, weight, labels, chunk_size=2)
+    from solution.chunk_loss import CHUNKED_LOSS_CALL_COUNT as count_after
+
+    assert count_after > count_before
+
+
+def test_chunked_loss_all_ignored_chunk():
+    """Verify that chunks where all tokens are ignored (labels == -100) yield zero loss and zero gradients."""
+    from solution.chunk_loss import chunked_causal_lm_loss
+
+    B, S, H, V = 2, 8, 16, 32
+    torch.manual_seed(42)
+    hidden = torch.randn((B, S, H), device="cuda", dtype=torch.float32, requires_grad=True)
+    weight = torch.randn((V, H), device="cuda", dtype=torch.float32)
+    labels = torch.full((B, S), -100, device="cuda", dtype=torch.long)
+    # Only label second row, leaving first row (first 8 tokens) completely ignored
+    labels[1, 4:] = torch.randint(0, V, (4,), device="cuda")
+
+    loss, metrics = chunked_causal_lm_loss(hidden, weight, labels, chunk_size=4)
+    loss.backward()
+
+    # The first row had all labels == -100, so its hidden gradient must be exactly 0
+    assert torch.all(hidden.grad[0] == 0.0)
+    assert metrics.labelled.item() == 4
+
+
+def test_chunked_loss_gradient_accumulation_and_denominator():
+    """Verify exact numerical agreement with custom num_items_in_batch denominator and GA scaling."""
+    from solution.chunk_loss import chunked_causal_lm_loss
+
+    B, S, H, V = 2, 8, 16, 32
+    torch.manual_seed(42)
+    hidden = torch.randn((B, S, H), device="cuda", dtype=torch.float32, requires_grad=True)
+    weight = torch.randn((V, H), device="cuda", dtype=torch.float32)
+    labels = torch.randint(0, V, (B, S), device="cuda")
+    labels[0, :2] = -100
+
+    hidden_ref = hidden.clone().detach().requires_grad_(True)
+    weight_ref = weight.clone().detach()
+
+    # Reference with num_items_in_batch = 50.0 and ga_steps = 2
+    logits_ref = torch.nn.functional.linear(hidden_ref, weight_ref)
+    shift_logits = logits_ref[:, :-1, :].reshape(-1, V)
+    shift_labels = labels[:, 1:].reshape(-1)
+    mask = (shift_labels != -100).float()
+    safe_labels = shift_labels.clamp(min=0)
+    log_probs = torch.nn.functional.log_softmax(shift_logits, dim=-1)
+    loss_ref = -(log_probs.gather(-1, safe_labels.unsqueeze(-1)).squeeze(-1) * mask).sum() / 50.0
+    loss_ref_scaled = loss_ref / 2.0
+    loss_ref_scaled.backward()
+
+    # Custom chunked
+    loss_custom, _ = chunked_causal_lm_loss(hidden, weight, labels, chunk_size=4, num_items_in_batch=50.0)
+    loss_custom_scaled = loss_custom / 2.0
+    loss_custom_scaled.backward()
+
+    torch.testing.assert_close(loss_custom, loss_ref, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(hidden.grad, hidden_ref.grad, rtol=1e-5, atol=1e-5)
