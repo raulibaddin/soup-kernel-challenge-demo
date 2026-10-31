@@ -11,7 +11,7 @@ import triton
 import triton.language as tl
 
 
-@triton.jit(do_not_specialize_on_alignment=["M"])
+@triton.jit(do_not_specialize_on_alignment=["M", "S", "HS"])
 def rope_fwd_kernel(
     X_ptr, Cos_ptr, Sin_ptr, Out_ptr,
     M, S, HS,
@@ -65,7 +65,7 @@ def rope_fwd_kernel(
     tl.store(out_second_ptr, out2.to(Out_ptr.dtype.element_ty))
 
 
-@triton.jit(do_not_specialize_on_alignment=["M"])
+@triton.jit(do_not_specialize_on_alignment=["M", "S", "HS"])
 def rope_bwd_kernel(
     DOut_ptr, Cos_ptr, Sin_ptr, DX_ptr,
     M, S, HS,

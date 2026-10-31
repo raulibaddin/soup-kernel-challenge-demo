@@ -3,7 +3,7 @@
 Accelerating and slimming `soup train` on a free Kaggle Tesla T4 GPU using custom Triton 3.6.0 kernels.
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Checks](https://img.shields.io/badge/Eligibility%20Checks-10%2F10%20PASS-brightgreen.svg)]()
+[![Checks](https://img.shields.io/badge/Eligibility%20Status-Audit%20Ready-blue.svg)]()
 [![Hardware](https://img.shields.io/badge/Platform-Kaggle%20T4%20(SM75)-orange.svg)]()
 
 ---
@@ -19,13 +19,14 @@ We optimize the fixed fine-tuning workload:
 - **Workload:** 256 Kazakh instruction rows, batch size 4, max sequence length 512, 1 epoch (64 steps)
 - **Target Hardware:** Kaggle Tesla T4 (Turing SM75, 15 GB VRAM, no BF16)
 
-### Key Achievements Against Base Soup 0.77.0:
-- **Full-command speedup ($s$):** **~1.254x** (~64.2 s vs ~80.5 s baseline)
-- **Peak GPU memory ratio ($m$):** **~1.178x** (~12,180 MiB vs ~14,350 MiB baseline)
-- **Held-out eval loss delta:** **+0.019%** (strict requirement: $\le 0.5\%$)
-- **Custom Triton kernel time share:** **~12.8%** (strict requirement: $\ge 5.0\%$, target $\ge 8\text{--}10\%$)
-- **Eligibility Checks:** **10 / 10 checks passed** on `harness/check_rules.py`
-- **Regression Tests:** **79 / 79 tests passed** on `SOUP_APPLY_SOLUTION=1 python -m pytest tests -q`
+### Target Objectives & Evaluation Criteria (Pending Kaggle T4 Measurement):
+- **Full-command speedup ($s$):** Target $s \ge 1.05\times$ (+5.0% gain required to earn speed points; design target $\ge 1.15\text{--}1.25\times$; mandatory Check 8 ceiling allows at most 10% slowdown).
+- **Peak GPU memory ratio ($m$):** Target $m \ge 1.05\times$ (+5.0% gain required to earn memory points; design target $\ge 1.10\text{--}1.18\times$; mandatory Check 8 ceiling allows at most 10% growth).
+- **Held-out eval loss delta:** Mandatory Check 7 ceiling $\le +0.50\%$ above base (design target $\le +0.10\%$).
+- **Custom Triton kernel time share:** Mandatory Check 4 gate $\ge 5.00\%$ of measured training-loop time across steps 3+ (safety design target $\ge 8\text{--}10\%$; pending official measurement).
+- **Eligibility Checks:** Designed to pass all 10 mandatory checks on `harness/check_rules.py`.
+- **Regression Tests:** Designed to pass all 79 Soup tests on `SOUP_APPLY_SOLUTION=1 python -m pytest tests -q`.
+- *Note:* Official numerical equivalence, speed, memory, and eligibility remain strictly pending execution on Kaggle Tesla T4.
 
 ---
 
@@ -102,27 +103,33 @@ The entire evaluation workflow is designed for frictionless reproduction by the 
 
 ### Option A: Official Evaluation in Kaggle Notebook (Recommended)
 1. Open the public Kaggle notebook:
-   **[Kaggle Notebook Link](https://www.kaggle.com/code/<user>/soup-kernel-challenge-submission?scriptVersionId=<VERSION_ID>)**
+   **Kaggle Notebook Link:** `[INCOMPLETE - RUN KAGGLE NOTEBOOK AND INSERT SAVED VERSION LINK HERE]`
 2. Ensure settings:
    - **Accelerator:** GPU T4 x2
    - **Internet:** On
-3. In Cell 1, confirm configuration:
+3. In Cell 1, confirm configuration and commit pinning:
    ```python
-   REPO_URL = "https://github.com/MakazhanAlpamys/soup-kernel-challenge.git"
-   COMMIT = "<FINAL_COMMIT_SHA>"  # or empty for default branch
+   REPO_URL = "https://github.com/raulibaddin/soup-kernel-challenge-demo.git"
+   COMMIT = "<SOURCE_COMMIT_SHA>"  # Must pin the candidate source commit SHA for official validation
    ```
-4. Click **Run All** (runs completely unattended in ~10 minutes).
+   > [!IMPORTANT]
+   > **Two-Commit Pinning Workflow:**
+   > - An empty `COMMIT = ""` is permitted strictly during iterative development (cloning HEAD of the default branch).
+   > - Before official validation and submission, `COMMIT` must be explicitly set to the exact source commit SHA of the candidate branch to ensure immutable reproduction and prevent silently evaluating unverified changes on `main`.
+   > - First, the source implementation is committed to the candidate branch. Second, that resulting commit SHA is pasted into Cell 1 of the notebook in a subsequent commit.
+4. Click **Run All** (execution duration depends on Kaggle environment queue times, resource allocation, and JIT compilation).
 5. The notebook automatically:
    - Prepares training and validation datasets.
-   - Executes baseline Soup and our solution side-by-side with fresh compiler caches.
-   - Evaluates adapter quality on held-out samples.
+   - Executes kernel correctness tests (`python -m pytest solution -q`).
+   - Executes baseline Soup and our solution side-by-side with fresh compiler caches (`python harness/run_task.py --repeats 2`).
+   - Evaluates adapter quality on held-out samples internally within `run_task.py` (`eval_adapter.py` logic).
    - Executes `check_rules.py` (verifying all 10 checks) and `score.py`.
 
 ### Option B: Local / Linux T4 Execution
 ```bash
 # 1. Clone repository
-git clone https://github.com/MakazhanAlpamys/soup-kernel-challenge.git
-cd soup-kernel-challenge
+git clone https://github.com/raulibaddin/soup-kernel-challenge-demo.git
+cd soup-kernel-challenge-demo
 
 # 2. Install pinned competition dependencies
 pip install "soup-cli[train]==0.77.0" "transformers==5.16.1" "peft==0.20.0" "trl==0.29.1" \
@@ -146,33 +153,34 @@ python harness/score.py runs/result.json
 
 ---
 
-## 4. Results & Limitations (5 / 5 Points)
+## 4. Performance Targets & Technical Analysis (Official Results Pending Kaggle Run)
 
-### 4.1 Comparative Benchmark Results
+### 4.1 Target Objectives & Verification Criteria
 
-Measurements taken on Kaggle Tesla T4 (FP16, `expandable_segments:True`, initial VRAM < 1000 MiB):
+The table below outlines our technical targets and the formal eligibility constraints enforced by `harness/check_rules.py`. Official measured values will be produced when running `harness/run_task.py --repeats 2` on Kaggle Tesla T4 (FP16, `expandable_segments:True`, initial VRAM < 1000 MiB):
 
-| Metric | Base Soup 0.77.0 | Our Solution | Ratio | Rules Margin |
+| Metric / Check | Mandatory Eligibility Limit | Competitive Scoring Threshold (`score.py`) | Solution Design Target | Status |
 |---|---|---|---|---|
-| **Command Wall Time** | 80.5 s | **64.2 s** | **$s = 1.254\times$** | $\ge 1.05\times$ threshold (+20.4% gain) |
-| **Peak GPU VRAM** | 14,350 MiB | **12,180 MiB** | **$m = 1.178\times$** | $\ge 1.05\times$ threshold (+17.8% gain) |
-| **Public Eval Loss** | 2.0504 | **2.0508** | **$+0.019\%$** | $\le 0.5\%$ ceiling (safe margin) |
-| **1st Step Loss Diff** | 0.0% | **0.18%** | — | $\le 1.0\%$ ceiling |
-| **Mean Loss Curve Gap** | 0.0% | **0.84%** | — | $\le 3.0\%$ ceiling |
-| **Custom Kernel Share** | 0.0% | **~12.8%** | — | $\ge 5.0\%$ gate (target $\ge 8\text{--}10\%$) |
-| **Soup Test Suite** | 79 / 79 | **79 / 79** | **100%** | Exact 79 passing tests |
+| **Command Wall Time ($s$)** | $\le 1.10\times$ base time (Check 8: max 10% slowdown) | $s \ge 1.05\times$ (+5.0% min gain to earn speed points) | Target $s \ge 1.15\text{--}1.25\times$ speedup | Pending Kaggle T4 Run |
+| **Peak GPU VRAM ($m$)** | $\le 1.10\times$ base peak (Check 8: max 10% growth) | $m \ge 1.05\times$ (+5.0% min gain to earn memory points) | Target $m \ge 1.10\text{--}1.18\times$ reduction | Pending Kaggle T4 Run |
+| **Public Eval Loss** | $\le +0.50\%$ above base (Check 7) | Required gate for admission | Target $\le +0.10\%$ delta | Pending Kaggle T4 Run |
+| **1st Step Loss Diff** | $\le 1.00\%$ relative delta (Check 6) | Required gate for admission | Target $\le 0.50\%$ delta | Pending Kaggle T4 Run |
+| **Mean Loss Curve Gap** | $\le 3.00\%$ relative delta (Check 6) | Required gate for admission | Target $\le 1.50\%$ delta | Pending Kaggle T4 Run |
+| **Custom Kernel Share** | $\ge 5.00\%$ of training time (Check 4) | Required gate for admission | Safety target $\ge 8\text{--}10\%$ | Pending Official Measurement |
+| **Soup Test Suite** | Exact 79 passing tests (Check 10) | Required gate for admission | 79 / 79 passing | Pending Kaggle T4 Run |
 
 ### 4.2 Score Calculation
-Using official Decentrathon 6.0 scoring formula:
-- **Works and Correct (10/10 checks):** **20.0 / 20 points**
-- **Speed Score:** $35 \times \frac{\ln(1.254)}{\ln(s_{\text{best}})}$
-- **Memory Score:** $30 \times \frac{\ln(1.178)}{\ln(m_{\text{best}})}$
-- **README & Reproducibility:** **15.0 / 15 points**
+Using official Decentrathon 6.0 scoring formula (`harness/score.py`):
+- **Works and Correct (10/10 checks):** Up to **20.0 points** (conditional on passing all 10 mandatory checks; 0 points if any check fails).
+- **Speed Score:** Up to $35.0 \times \frac{\ln(s)}{\ln(s_{\text{best}})}$ where $s \ge 1.05$.
+- **Memory Score:** Up to $30.0 \times \frac{\ln(m)}{\ln(m_{\text{best}})}$ where $m \ge 1.05$.
+- **README & Reproducibility:** Up to **15.0 points** (scored by jury by hand).
+- **Tie-breaker:** On equal points, higher memory ratio ranks higher.
 
-### 4.3 Engineering Challenges & Limitations
+### 4.3 Engineering Challenges & Technical Analysis
 1. **Dynamic Shape Specialization in Triton 3.6.0:**
-   - Triton specializes non-constexpr integer dimensions by `% 16 == 0`. Dynamic batch padding ($S \le 512$) caused mid-run kernel recompilation on step transitions where $S \% 4 \ne 0$.
-   - **Solution:** We applied alignment suppression `@triton.jit(do_not_specialize_on_alignment=["M"])` on all dynamic token counts while keeping tile dimensions static.
+   - Triton specializes non-constexpr integer dimensions by `% 16 == 0`. Dynamic batch padding ($S \le 512$) could trigger mid-run kernel recompilation on step transitions where sequence lengths vary.
+   - **Mitigation:** Applied alignment suppression `@triton.jit(do_not_specialize_on_alignment=["M", "S", "HS"])` on dynamic dimensions. Note: While alignment suppression is configured syntactically, actual reduction in compilation variants has not yet been measured with runtime compiler cache logs.
 2. **Defensive Testing Guards:**
    - In Soup regression tests (`tests/test_trainer_init.py`), modules and tensors are frequently mocked with `SimpleNamespace` or `MagicMock`. A naive patch evaluating `.is_cuda` failed test suites.
    - **Solution:** Implemented defensive type-guarding `if not (isinstance(x, torch.Tensor) and getattr(x, "is_cuda", False)): return original(...)`.

@@ -62,29 +62,15 @@ def rms_norm_bwd_kernel(
     stride_dout_row, stride_x_row, stride_dx_row,
     stride_dw_partial_row,
     BLOCK_N: tl.constexpr,
+    HAS_DW: tl.constexpr,
 ):
     """Backward pass of RMSNorm.
     
     Computes dx and partial dw for one row. dw is accumulated across rows later.
     
-    dx = rstd * (dout * w - x * rstd^2 * mean(dout * w * x) / N) ... wait, let me derive properly.
-    
     Forward: y = x * rstd * w, where rstd = 1/sqrt(mean(x^2) + eps)
-    
-    dy/dx: Let s = mean(x^2) + eps, rstd = s^{-1/2}
-    dy_i/dx_j = w_i * d(x_i * rstd)/dx_j
-              = w_i * [rstd * delta_ij + x_i * d(rstd)/dx_j]
-    d(rstd)/dx_j = -0.5 * s^{-3/2} * 2*x_j/N = -rstd^3 * x_j / N
-    
-    So: dy_i/dx_j = w_i * rstd * delta_ij - w_i * x_i * rstd^3 * x_j / N
-    
-    dx_j = sum_i (dout_i * dy_i/dx_j)
-         = dout_j * w_j * rstd - (rstd^3 / N) * x_j * sum_i(dout_i * w_i * x_i)
-    
-    Let c = sum_i(dout_i * w_i * x_i) / N
-    dx_j = rstd * (dout_j * w_j - rstd^2 * c * x_j)
-    
-    dw_i = sum_rows(dout_i * x_i * rstd)  (accumulated across rows)
+    dx_j = rstd * (dout_j * w_j - rstd^2 * c * x_j), where c = sum(dout * w * x) / N.
+    dw_i = sum_rows(dout_i * x_i * rstd) (computed only when HAS_DW is True).
     """
     row = tl.program_id(0)
     
@@ -107,7 +93,8 @@ def rms_norm_bwd_kernel(
     c = tl.sum(c_acc, axis=0) * (1.0 / N)
     
     # Second pass: compute dx and partial dw
-    dw_row_ptr = DW_partial_ptr + row * stride_dw_partial_row
+    if HAS_DW:
+        dw_row_ptr = DW_partial_ptr + row * stride_dw_partial_row
     
     for off in range(0, N, BLOCK_N):
         cols = off + tl.arange(0, BLOCK_N)
@@ -116,13 +103,14 @@ def rms_norm_bwd_kernel(
         x = tl.load(x_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
         w = tl.load(W_ptr + cols, mask=mask, other=0.0).to(tl.float32)
         
-        # dx = rstd * (dout * w - rstd^2 * c * x)
+        # dx = rstd * (dout * w - rstd * rstd * c * x)
         dx = rstd * (dout * w - rstd * rstd * c * x)
         tl.store(dx_row_ptr + cols, dx.to(DX_ptr.dtype.element_ty), mask=mask)
         
-        # partial dw for this row
-        dw = dout * x * rstd
-        tl.store(dw_row_ptr + cols, dw.to(DW_partial_ptr.dtype.element_ty), mask=mask)
+        # partial dw for this row only if needed
+        if HAS_DW:
+            dw = dout * x * rstd
+            tl.store(dw_row_ptr + cols, dw.to(DW_partial_ptr.dtype.element_ty), mask=mask)
 
 
 class TritonRMSNorm(torch.autograd.Function):
@@ -172,8 +160,16 @@ class TritonRMSNorm(torch.autograd.Function):
         M = grad_2d.shape[0]
         
         dx = torch.empty_like(x_2d)
-        # Partial dw: one row per token, will sum across M
-        dw_partial = torch.empty(M, N, device=x_2d.device, dtype=torch.float32)
+        needs_dw = bool(ctx.needs_input_grad[1])
+
+        if needs_dw:
+            # Partial dw: one row per token, will sum across M
+            dw_partial = torch.empty(M, N, device=x_2d.device, dtype=torch.float32)
+            stride_dw_partial_row = dw_partial.stride(0)
+        else:
+            # When dw is not needed (e.g. frozen norm in LoRA SFT), avoid allocating M*N*4 bytes
+            dw_partial = dx  # valid non-null CUDA pointer, never written to when HAS_DW=False
+            stride_dw_partial_row = 0
         
         grid = (M,)
         rms_norm_bwd_kernel[grid](
@@ -181,12 +177,13 @@ class TritonRMSNorm(torch.autograd.Function):
             dx, dw_partial,
             M, N,
             grad_2d.stride(0), x_2d.stride(0), dx.stride(0),
-            dw_partial.stride(0),
+            stride_dw_partial_row,
             BLOCK_N=BLOCK_N,
+            HAS_DW=needs_dw,
         )
         
         # Sum partial dw across all tokens only if weight requires grad
-        dw = dw_partial.sum(dim=0) if ctx.needs_input_grad[1] else None
+        dw = dw_partial.sum(dim=0) if needs_dw else None
         
         return dx.reshape(ctx.orig_shape), dw, None
 

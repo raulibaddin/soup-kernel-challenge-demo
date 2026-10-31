@@ -23,17 +23,31 @@ def test_swiglu_matches_pytorch(dtype, shape):
     up = torch.randn(shape, device="cuda", dtype=dtype, requires_grad=True)
     grad = torch.randn(shape, device="cuda", dtype=dtype)
 
-    ref = torch.nn.functional.silu(gate.float()) * up.float()
-    ref.backward(grad.float())
-    ref_dgate, ref_dup = gate.grad.float(), up.grad.float()
+    # Reference 1: FP32 upcast reference (Triton computes in FP32)
+    ref_fp32 = torch.nn.functional.silu(gate.float()) * up.float()
+    ref_fp32.backward(grad.float())
+    ref_dgate_fp32, ref_dup_fp32 = gate.grad.float().clone(), up.grad.float().clone()
+    gate.grad = up.grad = None
+
+    # Reference 2: Native dtype reference
+    ref_native = torch.nn.functional.silu(gate) * up
+    ref_native.backward(grad)
+    ref_dgate_native, ref_dup_native = gate.grad.clone(), up.grad.clone()
     gate.grad = up.grad = None
 
     out = swiglu(gate, up)
     out.backward(grad)
     tol = TOLERANCE[dtype]
-    torch.testing.assert_close(out.float(), ref, rtol=tol, atol=tol)
-    torch.testing.assert_close(gate.grad.float(), ref_dgate, rtol=tol, atol=tol)
-    torch.testing.assert_close(up.grad.float(), ref_dup, rtol=tol, atol=tol)
+
+    # Verify matching FP32 precision
+    torch.testing.assert_close(out.float(), ref_fp32, rtol=tol, atol=tol)
+    torch.testing.assert_close(gate.grad.float(), ref_dgate_fp32, rtol=tol, atol=tol)
+    torch.testing.assert_close(up.grad.float(), ref_dup_fp32, rtol=tol, atol=tol)
+
+    # Verify matching native dtype within tolerance
+    torch.testing.assert_close(out, ref_native, rtol=tol, atol=tol)
+    torch.testing.assert_close(gate.grad, ref_dgate_native, rtol=tol, atol=tol)
+    torch.testing.assert_close(up.grad, ref_dup_native, rtol=tol, atol=tol)
 
 
 # ============ RMSNorm tests ============
@@ -71,12 +85,13 @@ def test_rms_norm_forward(dtype, shape):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("weight_requires_grad", [True, False])
 @pytest.mark.parametrize("shape", [
     (4, 512, 1536),
     (2, 128, 1536),
     (1, 7, 768),
 ])
-def test_rms_norm_backward(dtype, shape):
+def test_rms_norm_backward(dtype, weight_requires_grad, shape):
     from solution.rms_norm import triton_rms_norm
     
     torch.manual_seed(42)
@@ -84,16 +99,16 @@ def test_rms_norm_backward(dtype, shape):
     N = shape[-1]
     
     x_ref = torch.randn(shape, device="cuda", dtype=dtype, requires_grad=True)
-    w_ref = torch.randn(N, device="cuda", dtype=torch.float32, requires_grad=True)
+    w_ref = torch.randn(N, device="cuda", dtype=torch.float32, requires_grad=weight_requires_grad)
     grad = torch.randn(shape, device="cuda", dtype=torch.float32)
     
     ref_out = _reference_rms_norm(x_ref, w_ref, eps)
     ref_out.backward(grad)
     ref_dx = x_ref.grad.clone()
-    ref_dw = w_ref.grad.clone()
+    ref_dw = w_ref.grad.clone() if weight_requires_grad else None
     
     x_tri = x_ref.detach().clone().requires_grad_(True)
-    w_tri = w_ref.detach().clone().requires_grad_(True)
+    w_tri = w_ref.detach().clone().requires_grad_(weight_requires_grad)
     
     tri_out = triton_rms_norm(x_tri, w_tri, eps)
     tri_out.backward(grad)
@@ -101,7 +116,11 @@ def test_rms_norm_backward(dtype, shape):
     tol = 5e-3 if dtype == torch.float16 else 1e-4
     torch.testing.assert_close(tri_out.float(), ref_out.float().detach(), rtol=tol, atol=tol)
     torch.testing.assert_close(x_tri.grad.float(), ref_dx.float(), rtol=tol, atol=tol)
-    torch.testing.assert_close(w_tri.grad.float(), ref_dw.float(), rtol=tol, atol=tol)
+    if weight_requires_grad:
+        assert w_tri.grad is not None
+        torch.testing.assert_close(w_tri.grad.float(), ref_dw.float(), rtol=tol, atol=tol)
+    else:
+        assert w_tri.grad is None
 
 
 # ============ RoPE tests ============

@@ -74,7 +74,7 @@ def patch_qwen2_mlp():
 
     def forward(self, x):
         act = getattr(getattr(self, "config", None), "hidden_act", "silu")
-        if act != "silu" or not x.is_cuda:
+        if act != "silu" or not (isinstance(x, torch.Tensor) and getattr(x, "is_cuda", False)):
             return original(self, x)
         return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
