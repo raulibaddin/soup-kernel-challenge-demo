@@ -11,7 +11,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a C
 TOLERANCE = {torch.float16: 2e-3, torch.float32: 1e-4}
 
 
-# ============ SwiGLU tests (example, kept) ============
+# ============ SwiGLU tests (custom 2D block-tiled kernel) ============
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 @pytest.mark.parametrize("shape", [(4, 512, 8960), (3, 77, 1001)])
@@ -69,17 +69,17 @@ def _reference_rms_norm(x, weight, eps):
 ])
 def test_rms_norm_forward(dtype, shape):
     from solution.rms_norm import triton_rms_norm
-    
+
     torch.manual_seed(42)
     eps = 1e-6
     N = shape[-1]
-    
+
     x = torch.randn(shape, device="cuda", dtype=dtype)
     weight = torch.randn(N, device="cuda", dtype=torch.float32)
-    
+
     ref = _reference_rms_norm(x, weight, eps)
     out = triton_rms_norm(x, weight, eps)
-    
+
     tol = TOLERANCE[dtype]
     torch.testing.assert_close(out.float(), ref.float(), rtol=tol, atol=tol)
 
@@ -93,26 +93,26 @@ def test_rms_norm_forward(dtype, shape):
 ])
 def test_rms_norm_backward(dtype, weight_requires_grad, shape):
     from solution.rms_norm import triton_rms_norm
-    
+
     torch.manual_seed(42)
     eps = 1e-6
     N = shape[-1]
-    
+
     x_ref = torch.randn(shape, device="cuda", dtype=dtype, requires_grad=True)
     w_ref = torch.randn(N, device="cuda", dtype=torch.float32, requires_grad=weight_requires_grad)
     grad = torch.randn(shape, device="cuda", dtype=torch.float32)
-    
+
     ref_out = _reference_rms_norm(x_ref, w_ref, eps)
     ref_out.backward(grad)
     ref_dx = x_ref.grad.clone()
     ref_dw = w_ref.grad.clone() if weight_requires_grad else None
-    
+
     x_tri = x_ref.detach().clone().requires_grad_(True)
     w_tri = w_ref.detach().clone().requires_grad_(weight_requires_grad)
-    
+
     tri_out = triton_rms_norm(x_tri, w_tri, eps)
     tri_out.backward(grad)
-    
+
     tol = 5e-3 if dtype == torch.float16 else 1e-4
     torch.testing.assert_close(tri_out.float(), ref_out.float().detach(), rtol=tol, atol=tol)
     torch.testing.assert_close(x_tri.grad.float(), ref_dx.float(), rtol=tol, atol=tol)
@@ -134,7 +134,7 @@ def _reference_rope(q, k, cos, sin):
 
     cos_u = cos.unsqueeze(1) if cos.ndim == 3 else cos
     sin_u = sin.unsqueeze(1) if sin.ndim == 3 else sin
-    
+
     q_out = (q * cos_u) + (rotate_half(q) * sin_u)
     k_out = (k * cos_u) + (rotate_half(k) * sin_u)
     return q_out, k_out
@@ -154,10 +154,10 @@ def test_rope_forward(dtype, B, H, S, D):
     q = torch.randn((B, H, S, D), device="cuda", dtype=dtype)
     cos = torch.randn((B, S, D), device="cuda", dtype=dtype)
     sin = torch.randn((B, S, D), device="cuda", dtype=dtype)
-    
+
     ref_q, _ = _reference_rope(q, q, cos, sin)
     tri_q = apply_triton_rope(q, cos, sin)
-    
+
     tol = TOLERANCE[dtype]
     torch.testing.assert_close(tri_q, ref_q, rtol=tol, atol=tol)
 
@@ -176,15 +176,48 @@ def test_rope_backward(dtype, B, H, S, D):
     cos = torch.randn((B, S, D), device="cuda", dtype=dtype)
     sin = torch.randn((B, S, D), device="cuda", dtype=dtype)
     grad = torch.randn((B, H, S, D), device="cuda", dtype=dtype)
-    
+
     ref_q, _ = _reference_rope(q_ref, q_ref, cos, sin)
     ref_q.backward(grad)
     ref_dq = q_ref.grad.clone()
-    
+
     q_tri = q_ref.detach().clone().requires_grad_(True)
     tri_q = apply_triton_rope(q_tri, cos, sin)
     tri_q.backward(grad)
-    
+
+    tol = TOLERANCE[dtype]
+    torch.testing.assert_close(tri_q, ref_q.detach(), rtol=tol, atol=tol)
+    torch.testing.assert_close(q_tri.grad, ref_dq, rtol=tol, atol=tol)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("B, H, S, D", [
+    (4, 12, 512, 128),
+    (4, 2, 512, 128),
+])
+def test_rope_realistic_frequencies(dtype, B, H, S, D):
+    """Test RoPE with authentic rotary frequency embeddings (bounded on unit circle)."""
+    from solution.rope import apply_triton_rope
+
+    torch.manual_seed(42)
+    inv_freq = 1.0 / (1000000.0 ** (torch.arange(0, D, 2, device="cuda", dtype=torch.float32) / D))
+    t = torch.arange(S, device="cuda", dtype=torch.float32)
+    freqs = torch.outer(t, inv_freq)
+    emb = torch.cat([freqs, freqs], dim=-1)
+    cos = emb.cos().unsqueeze(0).expand(B, -1, -1).to(dtype)
+    sin = emb.sin().unsqueeze(0).expand(B, -1, -1).to(dtype)
+
+    q_ref = torch.randn((B, H, S, D), device="cuda", dtype=dtype, requires_grad=True)
+    grad = torch.randn((B, H, S, D), device="cuda", dtype=dtype)
+
+    ref_q, _ = _reference_rope(q_ref, q_ref, cos, sin)
+    ref_q.backward(grad)
+    ref_dq = q_ref.grad.clone()
+
+    q_tri = q_ref.detach().clone().requires_grad_(True)
+    tri_q = apply_triton_rope(q_tri, cos, sin)
+    tri_q.backward(grad)
+
     tol = TOLERANCE[dtype]
     torch.testing.assert_close(tri_q, ref_q.detach(), rtol=tol, atol=tol)
     torch.testing.assert_close(q_tri.grad, ref_dq, rtol=tol, atol=tol)
